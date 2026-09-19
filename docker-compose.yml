@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    image: seal-chain-api:latest
+    container_name: seal-chain-api
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      # 分段校验续传令牌的 HMAC 签名密钥；生产环境务必用强随机值覆盖，
+      # 如 SEAL_CHAIN_TOKEN_SECRET=$(openssl rand -hex 32) docker compose up --build
+      - SEAL_CHAIN_TOKEN_SECRET=${SEAL_CHAIN_TOKEN_SECRET:-seal-chain-dev-secret}
+    restart: unless-stopped

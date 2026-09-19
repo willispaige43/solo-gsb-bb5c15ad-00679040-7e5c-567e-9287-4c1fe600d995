@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；并提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；并提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致。
 
 ## 校验规则（状态机）
 
@@ -492,6 +492,111 @@ curl -s http://localhost:8000/api/v1/seal-chain/handover-plan-audit \
 # Alice 准时、Bob 迟到 1800 秒：matched=2, late=1
 ```
 
+### `POST /api/v1/seal-chain/temperature-audit`
+
+温控责任审计。在单链状态机校验的基础上，回答“**越界温度的时间应当由谁负责**”。处理分五步：
+
+1. **调用现有单链校验器**，响应中原样保留 `validation`（结构同 `/validate`）；
+2. **生成保管人区间**：仅以 `validation.events` 中 `status = ok` 的 **seal / reseal / handover** 事件——每个有效事件以其时间戳开启对应保管人的半开区间 `[start, end)`，下一个有效事件闭合前一区间，最后一个区间向右开放；unseal 不改变保管人，违规事件（包括状态机层面不合法的 seal/reseal/handover）一律不产生区间；
+3. **推导越界区间**：温度样本时间戳必须**严格递增**（否则 `422`）；相邻样本间隔不超过 `max_gap_seconds` 时按**前值保持**形成半开区间 `[t_i, t_{i+1})`，超出阈值视为**数据空洞**、不计入任何时长；最后一个样本不形成区间。起始样本温度高于 `max_temperature` 的区间为高温越界（`high`），低于 `min_temperature` 的为低温越界（`low`），恰好等于阈值视为在范围内；
+4. **按保管人区间求交**：每段越界区间与保管人区间求交，**跨交接点（保管人区间边界）必须拆分**为多段；未被任何保管人区间覆盖的部分计入**未归属**；
+5. **汇总**：按保管人汇总高温 / 低温秒数与各自最大偏差（仅包含有越界时长的保管人，按首次归属时间升序），并给出全局最大偏差（含未归属段，并列时取时间最早者）与未归属总秒数。
+
+- `min_temperature` 不得大于 `max_temperature`，`max_gap_seconds` 必须为正数，温度与阈值不得为 NaN / 无穷（否则 `422`）；
+- 事件与样本的时间戳不得混用带时区与不带时区的时间（否则 `422`）；
+- 链本身存在状态机违规**不影响**审计接口返回 `200`，违规情况只体现在 `validation` 中。
+
+**请求体**
+
+```json
+{
+  "events": [
+    {"type": "seal",     "timestamp": "2026-09-19T08:00:00Z", "seal_id": "S001", "custodian": "Alice"},
+    {"type": "handover", "timestamp": "2026-09-19T09:05:00Z", "custodian": "Bob"}
+  ],
+  "samples": [
+    {"timestamp": "2026-09-19T09:00:00Z", "temperature": 10.5},
+    {"timestamp": "2026-09-19T09:10:00Z", "temperature": 5.0},
+    {"timestamp": "2026-09-19T09:20:00Z", "temperature": 1.0},
+    {"timestamp": "2026-09-19T09:30:00Z", "temperature": 5.0}
+  ],
+  "min_temperature": 2.0,
+  "max_temperature": 8.0,
+  "max_gap_seconds": 600
+}
+```
+
+- `samples[]`：温度样本，`timestamp` 必须严格递增；允许空列表
+- `min_temperature` / `max_temperature`：允许温度范围（均含边界，摄氏度）
+- `max_gap_seconds`：相邻样本最大间隔（秒），必须为正；间隔超过该值视为数据空洞
+
+**响应示例**（对应上例：高温区间 `[09:00,09:10)` 跨交接点 `09:05` 被拆分为 Alice / Bob 各 300 秒，低温区间 `[09:20,09:30)` 归 Bob）
+
+```json
+{
+  "validation": {
+    "valid": true,
+    "sealed": true,
+    "final_custodian": "Bob",
+    "current_seal": "S001",
+    "events": [
+      {"index": 0, "type": "seal",     "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 1, "type": "handover", "status": "ok", "reason": null, "cross_chain_conflict": false}
+    ],
+    "violations": []
+  },
+  "segments": [
+    {"start": "2026-09-19T09:00:00Z", "end": "2026-09-19T09:05:00Z", "seconds": 300.0,
+     "kind": "high", "temperature": 10.5, "deviation": 2.5, "sample_index": 0,
+     "custodian": "Alice", "custodian_event_index": 0},
+    {"start": "2026-09-19T09:05:00Z", "end": "2026-09-19T09:10:00Z", "seconds": 300.0,
+     "kind": "high", "temperature": 10.5, "deviation": 2.5, "sample_index": 0,
+     "custodian": "Bob", "custodian_event_index": 1},
+    {"start": "2026-09-19T09:20:00Z", "end": "2026-09-19T09:30:00Z", "seconds": 600.0,
+     "kind": "low", "temperature": 1.0, "deviation": 1.0, "sample_index": 2,
+     "custodian": "Bob", "custodian_event_index": 1}
+  ],
+  "custodians": [
+    {"custodian": "Alice", "high_seconds": 300.0, "low_seconds": 0.0,
+     "max_high_deviation": 2.5, "max_low_deviation": null},
+    {"custodian": "Bob", "high_seconds": 300.0, "low_seconds": 600.0,
+     "max_high_deviation": 2.5, "max_low_deviation": 1.0}
+  ],
+  "unattributed_seconds": 0.0,
+  "max_deviation": {"kind": "high", "deviation": 2.5, "sample_index": 0,
+                    "timestamp": "2026-09-19T09:00:00Z"}
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `validation` | 现有单链校验器的原始结果（结构同 `/validate`），审计仅采用其中 `status=ok` 的 seal/reseal/handover |
+| `segments[]` | 越界分段（半开 `[start, end)`），按时间升序；跨交接点已拆分 |
+| `segments[].kind` | `high`（高温越界）/ `low`（低温越界） |
+| `segments[].temperature` / `deviation` | 该段前值保持的温度与越界偏差（摄氏度） |
+| `segments[].sample_index` | 起始样本在 `samples` 中的下标（从 0 开始），可据此溯源 |
+| `segments[].custodian` / `custodian_event_index` | 归属保管人及开启其区间的有效事件下标（全链，从 0 开始）；未归属时均为 `null` |
+| `custodians[]` | 按保管人汇总的高温 / 低温秒数与各自最大偏差，按首次归属时间升序；仅包含有越界时长的保管人 |
+| `unattributed_seconds` | 未被任何保管人区间覆盖的越界总秒数（未归属时长） |
+| `max_deviation` | 全局最大偏差及其 `kind` / `sample_index` / `timestamp`；无任何越界时为 `null` |
+
+### 温控责任审计接口示例调用
+
+```bash
+curl -s http://localhost:8000/api/v1/seal-chain/temperature-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+          {"type": "seal", "timestamp": "2026-09-19T08:00:00Z",
+           "seal_id": "S001", "custodian": "Alice"}
+        ],
+        "samples": [
+          {"timestamp": "2026-09-19T09:00:00Z", "temperature": 10.5},
+          {"timestamp": "2026-09-19T09:10:00Z", "temperature": 5.0}
+        ],
+        "min_temperature": 2.0, "max_temperature": 8.0, "max_gap_seconds": 600}'
+# 高温越界 600 秒归 Alice：custodians[0].high_seconds = 600.0
+```
+
 ### `POST /api/v1/seal-chain/validate-chunk`
 
 分段校验超长事件链。把一条长链拆成若干段依次提交：**首段不带 `continuation_token`**，响应返回不透明的**续传令牌**；后续段携带上一响应返回的令牌，即可从上一段结束时的状态机状态继续校验。**逐事件判定与把所有分段拼接后调用 `/api/v1/seal-chain/validate` 完全一致**，响应中的 `index` 为全链偏移（从 0 开始）。
@@ -616,12 +721,13 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计与分段校验）
+  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计与分段校验）
   validator.py   # 单链状态机校验核心
   batch.py       # 批量封签占用检查（跨链冲突）
   reconcile.py   # 离线片段合并重建（去重 / 结构诊断 / 调用单链校验）
   exposure.py    # 开封暴露审计（开封区间推导 / 窗口合并 / 区间差）
   handover.py    # 交接计划符合性审计（实际到任提取 / 全局最优匹配动态规划）
+  temperature.py # 温控责任审计（保管人区间 / 前值保持越界区间 / 求交拆分与汇总）
   chunk.py       # 分段校验（续传令牌签发 / 验签 / 状态还原）
 tests/
   test_validator.py
@@ -629,6 +735,7 @@ tests/
   test_reconcile.py
   test_exposure.py
   test_handover.py
+  test_temperature.py
   test_chunk.py
 Dockerfile
 docker-compose.yml

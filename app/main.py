@@ -18,16 +18,19 @@ from .models import (
     HandoverPlanAuditResponse,
     ReconcileRequest,
     ReconcileResponse,
+    TemperatureAuditRequest,
+    TemperatureAuditResponse,
     ValidateRequest,
     ValidateResponse,
 )
 from .reconcile import reconcile
+from .temperature import TemperatureAuditError, audit_temperature
 from .validator import validate_events
 
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -124,4 +127,25 @@ def handover_plan_audit(request: HandoverPlanAuditRequest) -> HandoverPlanAuditR
     try:
         return audit_handover_plan(request)
     except HandoverPlanAuditError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/seal-chain/temperature-audit",
+    response_model=TemperatureAuditResponse,
+    tags=["seal-chain"],
+    summary="温控责任审计：越界温度时长按保管人归集",
+)
+def temperature_audit(request: TemperatureAuditRequest) -> TemperatureAuditResponse:
+    """保留原单链校验结果；仅以其中 status=ok 的 seal/reseal/handover 生成保管人
+    半开区间 [t_k, t_{k+1})（末段延伸至正无穷）。温度样本时间戳必须严格递增，
+    相邻样本间隔不超过 max_gap_seconds 时按前值保持形成 [t_i, t_{i+1})，超出
+    阈值视为数据空洞且不计时。越界（高于 max_temperature 为高温、低于
+    min_temperature 为低温）的前值保持区间与保管人区间求交，跨交接点必须拆分，
+    按保管人汇总高温 / 低温秒数，并返回可追溯的样本下标、最大偏差与未归属时长。
+    样本时间戳未严格递增、混用带时区与不带时区的时间、min_temperature 不小于
+    max_temperature 或 max_gap_seconds 非正数时返回 422。"""
+    try:
+        return audit_temperature(request)
+    except TemperatureAuditError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -439,3 +439,130 @@ class HandoverPlanAuditResponse(BaseModel):
         description="未匹配任何计划节点的实际到任记录，按事件下标升序",
     )
     summary: HandoverPlanSummary = Field(description="各状态数量汇总")
+
+
+# ---------------------------------------------------------------------------
+# 温控责任审计（/api/v1/seal-chain/temperature-audit）
+# ---------------------------------------------------------------------------
+
+
+class TemperatureSample(BaseModel):
+    """单条温度样本。timestamp 使用 ISO 8601 格式，样本间必须严格递增。"""
+
+    timestamp: datetime = Field(description="采样时间")
+    temperature: float = Field(allow_inf_nan=False, description="温度值（不允许 NaN / 无穷）")
+
+
+class TemperatureAuditRequest(BaseModel):
+    """温控责任审计请求：事件序列、温度样本、允许温度范围与最大采样间隔。"""
+
+    events: List[Event] = Field(default_factory=list)
+    samples: List[TemperatureSample] = Field(
+        default_factory=list,
+        description="温度样本，时间戳必须严格递增；相邻样本间隔不超过 max_gap_seconds 时"
+        "按前值保持形成半开区间 [t_i, t_{i+1})，超出阈值视为数据空洞且不计时",
+    )
+    min_temperature: float = Field(
+        allow_inf_nan=False, description="允许温度下限（含）；低于该值计为低温越界"
+    )
+    max_temperature: float = Field(
+        allow_inf_nan=False, description="允许温度上限（含）；高于该值计为高温越界"
+    )
+    max_gap_seconds: float = Field(
+        gt=0,
+        description="相邻样本形成前值保持区间所允许的最大间隔（秒），必须为正数；"
+        "间隔等于该值仍形成区间，超出则视为数据空洞",
+    )
+
+    @model_validator(mode="after")
+    def _temperature_range_valid(self) -> "TemperatureAuditRequest":
+        if not self.min_temperature < self.max_temperature:
+            raise ValueError("min_temperature 必须严格小于 max_temperature")
+        return self
+
+
+class TemperatureViolationSegment(BaseModel):
+    """一段越界时间：已与保管人区间求交、在交接点拆分后的最小分段（半开 [start, end)）。"""
+
+    custodian: Optional[str] = Field(
+        description="责任保管人；落在任何保管人区间之外（首个有效到任事件之前，"
+        "或全链无有效 seal/reseal/handover）时为 null"
+    )
+    kind: str = Field(description="high（高温越界）或 low（低温越界）")
+    start: datetime = Field(description="分段起点（含）")
+    end: datetime = Field(description="分段终点（不含）")
+    seconds: float = Field(description="分段时长（秒），等于 end - start")
+    sample_index: int = Field(
+        description="产生该段的温度样本下标（从 0 开始），即前值保持区间 [t_i, t_{i+1}) 的左端样本"
+    )
+    temperature: float = Field(description="该样本的温度值")
+    deviation: float = Field(
+        description="超出允许范围的偏差（>0）：高温为 temperature - max_temperature，"
+        "低温为 min_temperature - temperature"
+    )
+
+
+class MaxDeviation(BaseModel):
+    """最大偏差记录：可追溯到具体样本。"""
+
+    sample_index: int = Field(description="产生最大偏差的温度样本下标（从 0 开始）")
+    kind: str = Field(description="high（高温越界）或 low（低温越界）")
+    temperature: float = Field(description="该样本的温度值")
+    deviation: float = Field(description="超出允许范围的偏差（>0）")
+
+
+class CustodianTemperatureSummary(BaseModel):
+    """单个保管人的越界时长汇总。"""
+
+    custodian: str = Field(description="保管人")
+    high_seconds: float = Field(description="归属该保管人的高温越界总秒数")
+    low_seconds: float = Field(description="归属该保管人的低温越界总秒数")
+    max_deviation: Optional[MaxDeviation] = Field(
+        description="该保管人任内越界分段中的最大偏差；任内无越界时为 null"
+    )
+
+
+class DataHole(BaseModel):
+    """一处数据空洞：相邻样本间隔超过 max_gap_seconds，期间不计时。"""
+
+    start: datetime = Field(description="空洞起点，即前一样本时间")
+    end: datetime = Field(description="空洞终点，即后一样本时间")
+    seconds: float = Field(description="空洞时长（秒），等于 end - start")
+    prev_sample_index: int = Field(description="空洞前一样本的下标（从 0 开始）")
+    next_sample_index: int = Field(description="空洞后一样本的下标（从 0 开始）")
+
+
+class TemperatureAuditResponse(BaseModel):
+    """温控责任审计响应：保留原单链校验结果，另附按保管人归集的越界明细。"""
+
+    validation: ValidateResponse = Field(
+        description="现有单链校验器的原始结果；仅以其中 status=ok 的 seal/reseal/handover "
+        "生成保管人半开区间"
+    )
+    min_temperature: float = Field(description="回显请求中的允许温度下限")
+    max_temperature: float = Field(description="回显请求中的允许温度上限")
+    max_gap_seconds: float = Field(description="回显请求中的最大采样间隔（秒）")
+    custodians: List[CustodianTemperatureSummary] = Field(
+        default_factory=list,
+        description="按保管人汇总的高温 / 低温越界秒数，按其在有效到任事件中首次出现的顺序排列",
+    )
+    violations: List[TemperatureViolationSegment] = Field(
+        default_factory=list,
+        description="全部越界分段（已在交接点拆分），按时间升序；custodian 为 null 的分段未归属",
+    )
+    unattributed_high_seconds: float = Field(
+        default=0.0, description="未归属到任何保管人的高温越界总秒数"
+    )
+    unattributed_low_seconds: float = Field(
+        default=0.0, description="未归属到任何保管人的低温越界总秒数"
+    )
+    unattributed_seconds: float = Field(
+        default=0.0, description="未归属越界总秒数，即高温与低温未归属秒数之和"
+    )
+    max_deviation: Optional[MaxDeviation] = Field(
+        description="全部越界分段（含未归属）中的最大偏差；无任何越界时为 null"
+    )
+    data_holes: List[DataHole] = Field(
+        default_factory=list,
+        description="数据空洞（相邻样本间隔超过 max_gap_seconds），按时间升序；空洞期间不计时",
+    )
